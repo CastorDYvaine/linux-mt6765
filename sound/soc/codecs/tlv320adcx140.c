@@ -12,7 +12,6 @@
 #include <linux/regulator/consumer.h>
 #include <linux/acpi.h>
 #include <linux/of.h>
-#include <linux/of_gpio.h>
 #include <linux/slab.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -613,8 +612,7 @@ static int adcx140_phase_calib_info(struct snd_kcontrol *kcontrol,
 static int adcx140_phase_calib_get(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_value *value)
 {
-	struct snd_soc_component *codec =
-		snd_soc_kcontrol_component(kcontrol);
+	struct snd_soc_component *codec = snd_kcontrol_chip(kcontrol);
 	struct adcx140_priv *adcx140 = snd_soc_component_get_drvdata(codec);
 
 	value->value.integer.value[0] = adcx140->phase_calib_on ? 1 : 0;
@@ -626,8 +624,7 @@ static int adcx140_phase_calib_get(struct snd_kcontrol *kcontrol,
 static int adcx140_phase_calib_put(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_value *value)
 {
-	struct snd_soc_component *codec
-		= snd_soc_kcontrol_component(kcontrol);
+	struct snd_soc_component *codec = snd_kcontrol_chip(kcontrol);
 	struct adcx140_priv *adcx140 = snd_soc_component_get_drvdata(codec);
 
 	bool v = value->value.integer.value[0] ? true : false;

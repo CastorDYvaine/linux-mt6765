@@ -26,9 +26,9 @@ module_param(host_mode, bool, 0444);
 
 static DEFINE_IDA(intel_th_ida);
 
-static int intel_th_match(struct device *dev, struct device_driver *driver)
+static int intel_th_match(struct device *dev, const struct device_driver *driver)
 {
-	struct intel_th_driver *thdrv = to_intel_th_driver(driver);
+	const struct intel_th_driver *thdrv = to_intel_th_driver(driver);
 	struct intel_th_device *thdev = to_intel_th_device(dev);
 
 	if (thdev->type == INTEL_TH_SWITCH &&
@@ -166,7 +166,7 @@ static void intel_th_remove(struct device *dev)
 	pm_runtime_enable(dev);
 }
 
-static struct bus_type intel_th_bus = {
+static const struct bus_type intel_th_bus = {
 	.name		= "intel_th",
 	.match		= intel_th_match,
 	.probe		= intel_th_probe,
@@ -810,13 +810,17 @@ static int intel_th_output_open(struct inode *inode, struct file *file)
 	int err;
 
 	dev = bus_find_device_by_devt(&intel_th_bus, inode->i_rdev);
-	if (!dev || !dev->driver)
-		return -ENODEV;
+	if (!dev || !dev->driver) {
+		err = -ENODEV;
+		goto out_no_device;
+	}
 
 	thdrv = to_intel_th_driver(dev->driver);
 	fops = fops_get(thdrv->fops);
-	if (!fops)
-		return -ENODEV;
+	if (!fops) {
+		err = -ENODEV;
+		goto out_put_device;
+	}
 
 	replace_fops(file, fops);
 
@@ -824,10 +828,16 @@ static int intel_th_output_open(struct inode *inode, struct file *file)
 
 	if (file->f_op->open) {
 		err = file->f_op->open(inode, file);
-		return err;
+		if (err)
+			goto out_put_device;
 	}
 
 	return 0;
+
+out_put_device:
+	put_device(dev);
+out_no_device:
+	return err;
 }
 
 static const struct file_operations intel_th_output_fops = {
@@ -857,8 +867,9 @@ static irqreturn_t intel_th_irq(int irq, void *data)
 /**
  * intel_th_alloc() - allocate a new Intel TH device and its subdevices
  * @dev:	parent device
+ * @drvdata:	data private to the driver
  * @devres:	resources indexed by th_mmio_idx
- * @irq:	irq number
+ * @ndevres:	number of entries in the @devres resources
  */
 struct intel_th *
 intel_th_alloc(struct device *dev, const struct intel_th_drvdata *drvdata,

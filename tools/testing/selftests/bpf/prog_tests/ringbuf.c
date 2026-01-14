@@ -12,9 +12,12 @@
 #include <sys/sysinfo.h>
 #include <linux/perf_event.h>
 #include <linux/ring_buffer.h>
+
 #include "test_ringbuf.lskel.h"
 #include "test_ringbuf_n.lskel.h"
 #include "test_ringbuf_map_key.lskel.h"
+#include "test_ringbuf_write.lskel.h"
+#include "test_ringbuf_overwrite.lskel.h"
 
 #define EDONE 7777
 
@@ -82,6 +85,58 @@ static void *poll_thread(void *input)
 	long timeout = (long)input;
 
 	return (void *)(long)ring_buffer__poll(ringbuf, timeout);
+}
+
+static void ringbuf_write_subtest(void)
+{
+	struct test_ringbuf_write_lskel *skel;
+	int page_size = getpagesize();
+	size_t *mmap_ptr;
+	int err, rb_fd;
+
+	skel = test_ringbuf_write_lskel__open();
+	if (!ASSERT_OK_PTR(skel, "skel_open"))
+		return;
+
+	skel->maps.ringbuf.max_entries = 0x40000;
+
+	err = test_ringbuf_write_lskel__load(skel);
+	if (!ASSERT_OK(err, "skel_load"))
+		goto cleanup;
+
+	rb_fd = skel->maps.ringbuf.map_fd;
+
+	mmap_ptr = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, rb_fd, 0);
+	if (!ASSERT_OK_PTR(mmap_ptr, "rw_cons_pos"))
+		goto cleanup;
+	*mmap_ptr = 0x30000;
+	ASSERT_OK(munmap(mmap_ptr, page_size), "unmap_rw");
+
+	skel->bss->pid = getpid();
+
+	ringbuf = ring_buffer__new(rb_fd, process_sample, NULL, NULL);
+	if (!ASSERT_OK_PTR(ringbuf, "ringbuf_new"))
+		goto cleanup;
+
+	err = test_ringbuf_write_lskel__attach(skel);
+	if (!ASSERT_OK(err, "skel_attach"))
+		goto cleanup_ringbuf;
+
+	skel->bss->discarded = 0;
+	skel->bss->passed = 0;
+
+	/* trigger exactly two samples */
+	syscall(__NR_getpgid);
+	syscall(__NR_getpgid);
+
+	ASSERT_EQ(skel->bss->discarded, 2, "discarded");
+	ASSERT_EQ(skel->bss->passed, 0, "passed");
+
+	test_ringbuf_write_lskel__detach(skel);
+cleanup_ringbuf:
+	ring_buffer__free(ringbuf);
+cleanup:
+	test_ringbuf_write_lskel__destroy(skel);
 }
 
 static void ringbuf_subtest(void)
@@ -443,6 +498,68 @@ cleanup:
 	test_ringbuf_map_key_lskel__destroy(skel_map_key);
 }
 
+static void ringbuf_overwrite_mode_subtest(void)
+{
+	unsigned long size, len1, len2, len3, len4, len5;
+	unsigned long expect_avail_data, expect_prod_pos, expect_over_pos;
+	struct test_ringbuf_overwrite_lskel *skel;
+	int page_size = getpagesize();
+	int err;
+
+	skel = test_ringbuf_overwrite_lskel__open();
+	if (!ASSERT_OK_PTR(skel, "skel_open"))
+		return;
+
+	size = page_size;
+	len1 = page_size / 2;
+	len2 = page_size / 4;
+	len3 = size - len1 - len2 - BPF_RINGBUF_HDR_SZ * 3;
+	len4 = len3 - 8;
+	len5 = len3; /* retry with len3 */
+
+	skel->maps.ringbuf.max_entries = size;
+	skel->rodata->LEN1 = len1;
+	skel->rodata->LEN2 = len2;
+	skel->rodata->LEN3 = len3;
+	skel->rodata->LEN4 = len4;
+	skel->rodata->LEN5 = len5;
+
+	skel->bss->pid = getpid();
+
+	err = test_ringbuf_overwrite_lskel__load(skel);
+	if (!ASSERT_OK(err, "skel_load"))
+		goto cleanup;
+
+	err = test_ringbuf_overwrite_lskel__attach(skel);
+	if (!ASSERT_OK(err, "skel_attach"))
+		goto cleanup;
+
+	syscall(__NR_getpgid);
+
+	ASSERT_EQ(skel->bss->reserve1_fail, 0, "reserve 1");
+	ASSERT_EQ(skel->bss->reserve2_fail, 0, "reserve 2");
+	ASSERT_EQ(skel->bss->reserve3_fail, 1, "reserve 3");
+	ASSERT_EQ(skel->bss->reserve4_fail, 0, "reserve 4");
+	ASSERT_EQ(skel->bss->reserve5_fail, 0, "reserve 5");
+
+	ASSERT_EQ(skel->bss->ring_size, size, "check_ring_size");
+
+	expect_avail_data = len2 + len4 + len5 + 3 * BPF_RINGBUF_HDR_SZ;
+	ASSERT_EQ(skel->bss->avail_data, expect_avail_data, "check_avail_size");
+
+	ASSERT_EQ(skel->bss->cons_pos, 0, "check_cons_pos");
+
+	expect_prod_pos = len1 + len2 + len4 + len5 + 4 * BPF_RINGBUF_HDR_SZ;
+	ASSERT_EQ(skel->bss->prod_pos, expect_prod_pos, "check_prod_pos");
+
+	expect_over_pos = len1 + BPF_RINGBUF_HDR_SZ;
+	ASSERT_EQ(skel->bss->over_pos, expect_over_pos, "check_over_pos");
+
+	test_ringbuf_overwrite_lskel__detach(skel);
+cleanup:
+	test_ringbuf_overwrite_lskel__destroy(skel);
+}
+
 void test_ringbuf(void)
 {
 	if (test__start_subtest("ringbuf"))
@@ -451,4 +568,8 @@ void test_ringbuf(void)
 		ringbuf_n_subtest();
 	if (test__start_subtest("ringbuf_map_key"))
 		ringbuf_map_key_subtest();
+	if (test__start_subtest("ringbuf_write"))
+		ringbuf_write_subtest();
+	if (test__start_subtest("ringbuf_overwrite_mode"))
+		ringbuf_overwrite_mode_subtest();
 }

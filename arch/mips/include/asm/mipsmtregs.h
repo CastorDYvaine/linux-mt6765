@@ -10,7 +10,7 @@
 
 #include <asm/mipsregs.h>
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 
 /*
  * C macros
@@ -176,7 +176,7 @@
 /* TCHalt */
 #define TCHALT_H		(_ULCAST_(1))
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 
 static inline unsigned core_nvpes(void)
 {
@@ -322,7 +322,7 @@ static inline void ehb(void)
 	"	.set	push				\n"	\
 	"	.set	"MIPS_ISA_LEVEL"		\n"	\
 	_ASM_SET_MFTC0							\
-	"	mftc0	$1, " #rt ", " #sel "		\n"	\
+	"	mftc0	%0, " #rt ", " #sel "		\n"	\
 	_ASM_UNSET_MFTC0						\
 	"	.set	pop				\n"	\
 	: "=r" (__res));						\
@@ -469,6 +469,6 @@ do {									\
 
 __BUILD_SET_C0(mvpcontrol)
 
-#endif /* Not __ASSEMBLY__ */
+#endif /* Not __ASSEMBLER__ */
 
 #endif

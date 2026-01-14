@@ -13,7 +13,6 @@
 #include <linux/firewire-constants.h>
 #include <linux/fs.h>
 #include <linux/init.h>
-#include <linux/idr.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
@@ -29,62 +28,93 @@
 #include <asm/byteorder.h>
 
 #include "core.h"
-#include <trace/events/firewire.h>
 #include "packet-header-definitions.h"
+#include "phy-packet-definitions.h"
+#include <trace/events/firewire.h>
 
 #define HEADER_DESTINATION_IS_BROADCAST(header) \
 	((async_header_get_destination(header) & 0x3f) == 0x3f)
-
-#define PHY_PACKET_CONFIG	0x0
-#define PHY_PACKET_LINK_ON	0x1
-#define PHY_PACKET_SELF_ID	0x2
-
-#define PHY_CONFIG_GAP_COUNT(gap_count)	(((gap_count) << 16) | (1 << 22))
-#define PHY_CONFIG_ROOT_ID(node_id)	((((node_id) & 0x3f) << 24) | (1 << 23))
-#define PHY_IDENTIFIER(id)		((id) << 30)
 
 /* returns 0 if the split timeout handler is already running */
 static int try_cancel_split_timeout(struct fw_transaction *t)
 {
 	if (t->is_split_transaction)
-		return del_timer(&t->split_timeout_timer);
+		return timer_delete(&t->split_timeout_timer);
 	else
 		return 1;
 }
 
+// card->transactions.lock must be acquired in advance.
+static void remove_transaction_entry(struct fw_card *card, struct fw_transaction *entry)
+{
+	list_del_init(&entry->link);
+	card->transactions.tlabel_mask &= ~(1ULL << entry->tlabel);
+}
+
+// Must be called without holding card->transactions.lock.
+void fw_cancel_pending_transactions(struct fw_card *card)
+{
+	struct fw_transaction *t, *tmp;
+	LIST_HEAD(pending_list);
+
+	// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
+	// local destination never runs in any type of IRQ context.
+	scoped_guard(spinlock_irqsave, &card->transactions.lock) {
+		list_for_each_entry_safe(t, tmp, &card->transactions.list, link) {
+			if (try_cancel_split_timeout(t))
+				list_move(&t->link, &pending_list);
+		}
+	}
+
+	list_for_each_entry_safe(t, tmp, &pending_list, link) {
+		list_del(&t->link);
+
+		if (!t->with_tstamp) {
+			t->callback.without_tstamp(card, RCODE_CANCELLED, NULL, 0,
+						   t->callback_data);
+		} else {
+			t->callback.with_tstamp(card, RCODE_CANCELLED, t->packet.timestamp, 0,
+						NULL, 0, t->callback_data);
+		}
+	}
+}
+
+// card->transactions.lock must be acquired in advance.
+#define find_and_pop_transaction_entry(card, condition)			\
+({									\
+	struct fw_transaction *iter, *t = NULL;				\
+	list_for_each_entry(iter, &card->transactions.list, link) {	\
+		if (condition) {					\
+			t = iter;					\
+			break;						\
+		}							\
+	}								\
+	if (t && try_cancel_split_timeout(t))				\
+		remove_transaction_entry(card, t);			\
+	t;								\
+})
+
 static int close_transaction(struct fw_transaction *transaction, struct fw_card *card, int rcode,
 			     u32 response_tstamp)
 {
-	struct fw_transaction *t = NULL, *iter;
-	unsigned long flags;
+	struct fw_transaction *t;
 
-	spin_lock_irqsave(&card->lock, flags);
-	list_for_each_entry(iter, &card->transaction_list, link) {
-		if (iter == transaction) {
-			if (!try_cancel_split_timeout(iter)) {
-				spin_unlock_irqrestore(&card->lock, flags);
-				goto timed_out;
-			}
-			list_del_init(&iter->link);
-			card->tlabel_mask &= ~(1ULL << iter->tlabel);
-			t = iter;
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&card->lock, flags);
-
-	if (t) {
-		if (!t->with_tstamp) {
-			t->callback.without_tstamp(card, rcode, NULL, 0, t->callback_data);
-		} else {
-			t->callback.with_tstamp(card, rcode, t->packet.timestamp, response_tstamp,
-						NULL, 0, t->callback_data);
-		}
-		return 0;
+	// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
+	// local destination never runs in any type of IRQ context.
+	scoped_guard(spinlock_irqsave, &card->transactions.lock) {
+		t = find_and_pop_transaction_entry(card, iter == transaction);
+		if (!t)
+			return -ENOENT;
 	}
 
- timed_out:
-	return -ENOENT;
+	if (!t->with_tstamp) {
+		t->callback.without_tstamp(card, rcode, NULL, 0, t->callback_data);
+	} else {
+		t->callback.with_tstamp(card, rcode, t->packet.timestamp, response_tstamp, NULL, 0,
+					t->callback_data);
+	}
+
+	return 0;
 }
 
 /*
@@ -126,18 +156,14 @@ EXPORT_SYMBOL(fw_cancel_transaction);
 
 static void split_transaction_timeout_callback(struct timer_list *timer)
 {
-	struct fw_transaction *t = from_timer(t, timer, split_timeout_timer);
+	struct fw_transaction *t = timer_container_of(t, timer, split_timeout_timer);
 	struct fw_card *card = t->card;
-	unsigned long flags;
 
-	spin_lock_irqsave(&card->lock, flags);
-	if (list_empty(&t->link)) {
-		spin_unlock_irqrestore(&card->lock, flags);
-		return;
+	scoped_guard(spinlock_irqsave, &card->transactions.lock) {
+		if (list_empty(&t->link))
+			return;
+		remove_transaction_entry(card, t);
 	}
-	list_del(&t->link);
-	card->tlabel_mask &= ~(1ULL << t->tlabel);
-	spin_unlock_irqrestore(&card->lock, flags);
 
 	if (!t->with_tstamp) {
 		t->callback.without_tstamp(card, RCODE_CANCELLED, NULL, 0, t->callback_data);
@@ -150,20 +176,18 @@ static void split_transaction_timeout_callback(struct timer_list *timer)
 static void start_split_transaction_timeout(struct fw_transaction *t,
 					    struct fw_card *card)
 {
-	unsigned long flags;
+	unsigned long delta;
 
-	spin_lock_irqsave(&card->lock, flags);
-
-	if (list_empty(&t->link) || WARN_ON(t->is_split_transaction)) {
-		spin_unlock_irqrestore(&card->lock, flags);
+	if (list_empty(&t->link) || WARN_ON(t->is_split_transaction))
 		return;
-	}
 
 	t->is_split_transaction = true;
-	mod_timer(&t->split_timeout_timer,
-		  jiffies + card->split_timeout_jiffies);
 
-	spin_unlock_irqrestore(&card->lock, flags);
+	// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
+	// local destination never runs in any type of IRQ context.
+	scoped_guard(spinlock_irqsave, &card->split_timeout.lock)
+		delta = card->split_timeout.jiffies;
+	mod_timer(&t->split_timeout_timer, jiffies + delta);
 }
 
 static u32 compute_split_timeout_timestamp(struct fw_card *card, u32 request_timestamp);
@@ -174,8 +198,8 @@ static void transmit_complete_callback(struct fw_packet *packet,
 	struct fw_transaction *t =
 	    container_of(packet, struct fw_transaction, packet);
 
-	trace_async_request_outbound_complete((uintptr_t)t, packet->generation, packet->speed,
-					      status, packet->timestamp);
+	trace_async_request_outbound_complete((uintptr_t)t, card->index, packet->generation,
+					      packet->speed, status, packet->timestamp);
 
 	switch (status) {
 	case ACK_COMPLETE:
@@ -183,8 +207,12 @@ static void transmit_complete_callback(struct fw_packet *packet,
 		break;
 	case ACK_PENDING:
 	{
-		t->split_timeout_cycle =
-			compute_split_timeout_timestamp(card, packet->timestamp) & 0xffff;
+		// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
+		// local destination never runs in any type of IRQ context.
+		scoped_guard(spinlock_irqsave, &card->split_timeout.lock) {
+			t->split_timeout_cycle =
+				compute_split_timeout_timestamp(card, packet->timestamp) & 0xffff;
+		}
 		start_split_transaction_timeout(t, card);
 		break;
 	}
@@ -280,18 +308,21 @@ static void fw_fill_request(struct fw_packet *packet, int tcode, int tlabel,
 }
 
 static int allocate_tlabel(struct fw_card *card)
+__must_hold(&card->transactions.lock)
 {
 	int tlabel;
 
-	tlabel = card->current_tlabel;
-	while (card->tlabel_mask & (1ULL << tlabel)) {
+	lockdep_assert_held(&card->transactions.lock);
+
+	tlabel = card->transactions.current_tlabel;
+	while (card->transactions.tlabel_mask & (1ULL << tlabel)) {
 		tlabel = (tlabel + 1) & 0x3f;
-		if (tlabel == card->current_tlabel)
+		if (tlabel == card->transactions.current_tlabel)
 			return -EBUSY;
 	}
 
-	card->current_tlabel = (tlabel + 1) & 0x3f;
-	card->tlabel_mask |= 1ULL << tlabel;
+	card->transactions.current_tlabel = (tlabel + 1) & 0x3f;
+	card->transactions.tlabel_mask |= 1ULL << tlabel;
 
 	return tlabel;
 }
@@ -352,7 +383,6 @@ void __fw_send_request(struct fw_card *card, struct fw_transaction *t, int tcode
 		void *payload, size_t length, union fw_transaction_callback callback,
 		bool with_tstamp, void *callback_data)
 {
-	unsigned long flags;
 	int tlabel;
 
 	/*
@@ -360,11 +390,11 @@ void __fw_send_request(struct fw_card *card, struct fw_transaction *t, int tcode
 	 * the list while holding the card spinlock.
 	 */
 
-	spin_lock_irqsave(&card->lock, flags);
-
-	tlabel = allocate_tlabel(card);
+	// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
+	// local destination never runs in any type of IRQ context.
+	scoped_guard(spinlock_irqsave, &card->transactions.lock)
+		tlabel = allocate_tlabel(card);
 	if (tlabel < 0) {
-		spin_unlock_irqrestore(&card->lock, flags);
 		if (!with_tstamp) {
 			callback.without_tstamp(card, RCODE_SEND_ERROR, NULL, 0, callback_data);
 		} else {
@@ -389,16 +419,24 @@ void __fw_send_request(struct fw_card *card, struct fw_transaction *t, int tcode
 	t->callback = callback;
 	t->with_tstamp = with_tstamp;
 	t->callback_data = callback_data;
-
-	fw_fill_request(&t->packet, tcode, t->tlabel, destination_id, card->node_id, generation,
-			speed, offset, payload, length);
 	t->packet.callback = transmit_complete_callback;
 
-	list_add_tail(&t->link, &card->transaction_list);
+	// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
+	// local destination never runs in any type of IRQ context.
+	scoped_guard(spinlock_irqsave, &card->lock) {
+		// The node_id field of fw_card can be updated when handling SelfIDComplete.
+		fw_fill_request(&t->packet, tcode, t->tlabel, destination_id, card->node_id,
+				generation, speed, offset, payload, length);
+	}
 
-	spin_unlock_irqrestore(&card->lock, flags);
+	// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
+	// local destination never runs in any type of IRQ context.
+	scoped_guard(spinlock_irqsave, &card->transactions.lock)
+		list_add_tail(&t->link, &card->transactions.list);
 
-	trace_async_request_outbound_initiate((uintptr_t)t, generation, speed, t->packet.header, payload,
+	// Safe with no lock, since the index field of fw_card is immutable once assigned.
+	trace_async_request_outbound_initiate((uintptr_t)t, card->index, generation, speed,
+					      t->packet.header, payload,
 					      tcode_is_read_request(tcode) ? 0 : length / 4);
 
 	card->driver->send_request(card, &t->packet);
@@ -451,7 +489,7 @@ int fw_run_transaction(struct fw_card *card, int tcode, int destination_id,
 	fw_send_request(card, &t, tcode, destination_id, generation, speed,
 			offset, payload, length, transaction_callback, &d);
 	wait_for_completion(&d.done);
-	destroy_timer_on_stack(&t.split_timeout_timer);
+	timer_destroy_on_stack(&t.split_timeout_timer);
 
 	return d.rcode;
 }
@@ -463,14 +501,13 @@ static DECLARE_COMPLETION(phy_config_done);
 static void transmit_phy_packet_callback(struct fw_packet *packet,
 					 struct fw_card *card, int status)
 {
-	trace_async_phy_outbound_complete((uintptr_t)packet, packet->generation, status,
+	trace_async_phy_outbound_complete((uintptr_t)packet, card->index, packet->generation, status,
 					  packet->timestamp);
 	complete(&phy_config_done);
 }
 
 static struct fw_packet phy_config_packet = {
 	.header_length	= 12,
-	.header[0]	= TCODE_LINK_INTERNAL << 4,
 	.payload_length	= 0,
 	.speed		= SCODE_100,
 	.callback	= transmit_phy_packet_callback,
@@ -479,11 +516,15 @@ static struct fw_packet phy_config_packet = {
 void fw_send_phy_config(struct fw_card *card,
 			int node_id, int generation, int gap_count)
 {
-	long timeout = DIV_ROUND_UP(HZ, 10);
-	u32 data = PHY_IDENTIFIER(PHY_PACKET_CONFIG);
+	long timeout = msecs_to_jiffies(100);
+	u32 data = 0;
 
-	if (node_id != FW_PHY_CONFIG_NO_NODE_ID)
-		data |= PHY_CONFIG_ROOT_ID(node_id);
+	phy_packet_set_packet_identifier(&data, PHY_PACKET_PACKET_IDENTIFIER_PHY_CONFIG);
+
+	if (node_id != FW_PHY_CONFIG_NO_NODE_ID) {
+		phy_packet_phy_config_set_root_id(&data, node_id);
+		phy_packet_phy_config_set_force_root_node(&data, true);
+	}
 
 	if (gap_count == FW_PHY_CONFIG_CURRENT_GAP_COUNT) {
 		gap_count = card->driver->read_phy_reg(card, 1);
@@ -494,23 +535,23 @@ void fw_send_phy_config(struct fw_card *card,
 		if (gap_count == 63)
 			return;
 	}
-	data |= PHY_CONFIG_GAP_COUNT(gap_count);
+	phy_packet_phy_config_set_gap_count(&data, gap_count);
+	phy_packet_phy_config_set_gap_count_optimization(&data, true);
 
-	mutex_lock(&phy_config_mutex);
+	guard(mutex)(&phy_config_mutex);
 
+	async_header_set_tcode(phy_config_packet.header, TCODE_LINK_INTERNAL);
 	phy_config_packet.header[1] = data;
 	phy_config_packet.header[2] = ~data;
 	phy_config_packet.generation = generation;
 	reinit_completion(&phy_config_done);
 
-	trace_async_phy_outbound_initiate((uintptr_t)&phy_config_packet,
+	trace_async_phy_outbound_initiate((uintptr_t)&phy_config_packet, card->index,
 					  phy_config_packet.generation, phy_config_packet.header[1],
 					  phy_config_packet.header[2]);
 
 	card->driver->send_request(card, &phy_config_packet);
 	wait_for_completion_timeout(&phy_config_done, timeout);
-
-	mutex_unlock(&phy_config_mutex);
 }
 
 static struct fw_address_handler *lookup_overlapping_address_handler(
@@ -567,6 +608,23 @@ const struct fw_address_region fw_unit_space_region =
 	{ .start = 0xfffff0000900ULL, .end = 0x1000000000000ULL, };
 #endif  /*  0  */
 
+static void complete_address_handler(struct kref *kref)
+{
+	struct fw_address_handler *handler = container_of(kref, struct fw_address_handler, kref);
+
+	complete(&handler->done);
+}
+
+static void get_address_handler(struct fw_address_handler *handler)
+{
+	kref_get(&handler->kref);
+}
+
+static int put_address_handler(struct fw_address_handler *handler)
+{
+	return kref_put(&handler->kref, complete_address_handler);
+}
+
 /**
  * fw_core_add_address_handler() - register for incoming requests
  * @handler:	callback
@@ -574,9 +632,10 @@ const struct fw_address_region fw_unit_space_region =
  *
  * region->start, ->end, and handler->length have to be quadlet-aligned.
  *
- * When a request is received that falls within the specified address range,
- * the specified callback is invoked.  The parameters passed to the callback
- * give the details of the particular request.
+ * When a request is received that falls within the specified address range, the specified callback
+ * is invoked.  The parameters passed to the callback give the details of the particular request.
+ * The callback is invoked in the workqueue context in most cases. However, if the request is
+ * initiated by the local node, the callback is invoked in the initiator's context.
  *
  * To be called in process context.
  * Return value:  0 on success, non-zero otherwise.
@@ -599,7 +658,7 @@ int fw_core_add_address_handler(struct fw_address_handler *handler,
 	    handler->length == 0)
 		return -EINVAL;
 
-	spin_lock(&address_handler_list_lock);
+	guard(spinlock)(&address_handler_list_lock);
 
 	handler->offset = region->start;
 	while (handler->offset + handler->length <= region->end) {
@@ -612,13 +671,13 @@ int fw_core_add_address_handler(struct fw_address_handler *handler,
 		if (other != NULL) {
 			handler->offset += other->length;
 		} else {
+			init_completion(&handler->done);
+			kref_init(&handler->kref);
 			list_add_tail_rcu(&handler->link, &address_handler_list);
 			ret = 0;
 			break;
 		}
 	}
-
-	spin_unlock(&address_handler_list_lock);
 
 	return ret;
 }
@@ -635,10 +694,13 @@ EXPORT_SYMBOL(fw_core_add_address_handler);
  */
 void fw_core_remove_address_handler(struct fw_address_handler *handler)
 {
-	spin_lock(&address_handler_list_lock);
-	list_del_rcu(&handler->link);
-	spin_unlock(&address_handler_list_lock);
+	scoped_guard(spinlock, &address_handler_list_lock)
+		list_del_rcu(&handler->link);
+
 	synchronize_rcu();
+
+	if (!put_address_handler(handler))
+		wait_for_completion(&handler->done);
 }
 EXPORT_SYMBOL(fw_core_remove_address_handler);
 
@@ -674,7 +736,7 @@ static void free_response_callback(struct fw_packet *packet,
 {
 	struct fw_request *request = container_of(packet, struct fw_request, response);
 
-	trace_async_response_outbound_complete((uintptr_t)request, packet->generation,
+	trace_async_response_outbound_complete((uintptr_t)request, card->index, packet->generation,
 					       packet->speed, status, packet->timestamp);
 
 	// Decrease the reference count since not at in-flight.
@@ -775,11 +837,14 @@ EXPORT_SYMBOL(fw_fill_response);
 
 static u32 compute_split_timeout_timestamp(struct fw_card *card,
 					   u32 request_timestamp)
+__must_hold(&card->split_timeout.lock)
 {
 	unsigned int cycles;
 	u32 timestamp;
 
-	cycles = card->split_timeout_cycles;
+	lockdep_assert_held(&card->split_timeout.lock);
+
+	cycles = card->split_timeout.cycles;
 	cycles += request_timestamp & 0x1fff;
 
 	timestamp = request_timestamp & ~0x1fff;
@@ -830,9 +895,12 @@ static struct fw_request *allocate_request(struct fw_card *card,
 		return NULL;
 	kref_init(&request->kref);
 
+	// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
+	// local destination never runs in any type of IRQ context.
+	scoped_guard(spinlock_irqsave, &card->split_timeout.lock)
+		request->response.timestamp = compute_split_timeout_timestamp(card, p->timestamp);
+
 	request->response.speed = p->speed;
-	request->response.timestamp =
-			compute_split_timeout_timestamp(card, p->timestamp);
 	request->response.generation = p->generation;
 	request->response.ack = 0;
 	request->response.callback = free_response_callback;
@@ -879,9 +947,10 @@ void fw_send_response(struct fw_card *card,
 	// Increase the reference count so that the object is kept during in-flight.
 	fw_request_get(request);
 
-	trace_async_response_outbound_initiate((uintptr_t)request, request->response.generation,
-					       request->response.speed, request->response.header,
-					       data, data ? data_length / 4 : 0);
+	trace_async_response_outbound_initiate((uintptr_t)request, card->index,
+					       request->response.generation, request->response.speed,
+					       request->response.header, data,
+					       data ? data_length / 4 : 0);
 
 	card->driver->send_response(card, &request->response);
 }
@@ -927,28 +996,35 @@ static void handle_exclusive_region_request(struct fw_card *card,
 	if (tcode == TCODE_LOCK_REQUEST)
 		tcode = 0x10 + async_header_get_extended_tcode(p->header);
 
-	rcu_read_lock();
-	handler = lookup_enclosing_address_handler(&address_handler_list,
-						   offset, request->length);
-	if (handler)
-		handler->address_callback(card, request,
-					  tcode, destination, source,
-					  p->generation, offset,
-					  request->data, request->length,
-					  handler->callback_data);
-	rcu_read_unlock();
+	scoped_guard(rcu) {
+		handler = lookup_enclosing_address_handler(&address_handler_list, offset,
+							   request->length);
+		if (handler)
+			get_address_handler(handler);
+	}
 
-	if (!handler)
+	if (!handler) {
 		fw_send_response(card, request, RCODE_ADDRESS_ERROR);
+		return;
+	}
+
+	// Outside the RCU read-side critical section. Without spinlock. With reference count.
+	handler->address_callback(card, request, tcode, destination, source, p->generation, offset,
+				  request->data, request->length, handler->callback_data);
+	put_address_handler(handler);
 }
+
+// To use kmalloc allocator efficiently, this should be power of two.
+#define BUFFER_ON_KERNEL_STACK_SIZE	4
 
 static void handle_fcp_region_request(struct fw_card *card,
 				      struct fw_packet *p,
 				      struct fw_request *request,
 				      unsigned long long offset)
 {
-	struct fw_address_handler *handler;
-	int tcode, destination, source;
+	struct fw_address_handler *buffer_on_kernel_stack[BUFFER_ON_KERNEL_STACK_SIZE];
+	struct fw_address_handler *handler, **handlers;
+	int tcode, destination, source, i, count, buffer_size;
 
 	if ((offset != (CSR_REGISTER_BASE | CSR_FCP_COMMAND) &&
 	     offset != (CSR_REGISTER_BASE | CSR_FCP_RESPONSE)) ||
@@ -969,17 +1045,54 @@ static void handle_fcp_region_request(struct fw_card *card,
 		return;
 	}
 
-	rcu_read_lock();
-	list_for_each_entry_rcu(handler, &address_handler_list, link) {
-		if (is_enclosing_handler(handler, offset, request->length))
-			handler->address_callback(card, request, tcode,
-						  destination, source,
-						  p->generation, offset,
-						  request->data,
-						  request->length,
-						  handler->callback_data);
+	count = 0;
+	handlers = buffer_on_kernel_stack;
+	buffer_size = ARRAY_SIZE(buffer_on_kernel_stack);
+	scoped_guard(rcu) {
+		list_for_each_entry_rcu(handler, &address_handler_list, link) {
+			if (is_enclosing_handler(handler, offset, request->length)) {
+				if (count >= buffer_size) {
+					int next_size = buffer_size * 2;
+					struct fw_address_handler **buffer_on_kernel_heap;
+
+					if (handlers == buffer_on_kernel_stack)
+						buffer_on_kernel_heap = NULL;
+					else
+						buffer_on_kernel_heap = handlers;
+
+					buffer_on_kernel_heap =
+						krealloc_array(buffer_on_kernel_heap, next_size,
+							sizeof(*buffer_on_kernel_heap), GFP_ATOMIC);
+					// FCP is used for purposes unrelated to significant system
+					// resources (e.g. storage or networking), so allocation
+					// failures are not considered so critical.
+					if (!buffer_on_kernel_heap)
+						break;
+
+					if (handlers == buffer_on_kernel_stack) {
+						memcpy(buffer_on_kernel_heap, buffer_on_kernel_stack,
+						       sizeof(buffer_on_kernel_stack));
+					}
+
+					handlers = buffer_on_kernel_heap;
+					buffer_size = next_size;
+				}
+				get_address_handler(handler);
+				handlers[count++] = handler;
+			}
+		}
 	}
-	rcu_read_unlock();
+
+	for (i = 0; i < count; ++i) {
+		handler = handlers[i];
+		handler->address_callback(card, request, tcode, destination, source,
+					  p->generation, offset, request->data,
+					  request->length, handler->callback_data);
+		put_address_handler(handler);
+	}
+
+	if (handlers != buffer_on_kernel_stack)
+		kfree(handlers);
 
 	fw_send_response(card, request, RCODE_COMPLETE);
 }
@@ -995,7 +1108,7 @@ void fw_core_handle_request(struct fw_card *card, struct fw_packet *p)
 
 	tcode = async_header_get_tcode(p->header);
 	if (tcode_is_link_internal(tcode)) {
-		trace_async_phy_inbound((uintptr_t)p, p->generation, p->ack, p->timestamp,
+		trace_async_phy_inbound((uintptr_t)p, card->index, p->generation, p->ack, p->timestamp,
 					 p->header[1], p->header[2]);
 		fw_cdev_handle_phy_packet(card, p);
 		return;
@@ -1007,8 +1120,8 @@ void fw_core_handle_request(struct fw_card *card, struct fw_packet *p)
 		return;
 	}
 
-	trace_async_request_inbound((uintptr_t)request, p->generation, p->speed, p->ack,
-				    p->timestamp, p->header, request->data,
+	trace_async_request_inbound((uintptr_t)request, card->index, p->generation, p->speed,
+				    p->ack, p->timestamp, p->header, request->data,
 				    tcode_is_read_request(tcode) ? 0 : request->length / 4);
 
 	offset = async_header_get_offset(p->header);
@@ -1023,8 +1136,7 @@ EXPORT_SYMBOL(fw_core_handle_request);
 
 void fw_core_handle_response(struct fw_card *card, struct fw_packet *p)
 {
-	struct fw_transaction *t = NULL, *iter;
-	unsigned long flags;
+	struct fw_transaction *t = NULL;
 	u32 *data;
 	size_t data_length;
 	int tcode, tlabel, source, rcode;
@@ -1063,26 +1175,17 @@ void fw_core_handle_response(struct fw_card *card, struct fw_packet *p)
 		break;
 	}
 
-	spin_lock_irqsave(&card->lock, flags);
-	list_for_each_entry(iter, &card->transaction_list, link) {
-		if (iter->node_id == source && iter->tlabel == tlabel) {
-			if (!try_cancel_split_timeout(iter)) {
-				spin_unlock_irqrestore(&card->lock, flags);
-				goto timed_out;
-			}
-			list_del_init(&iter->link);
-			card->tlabel_mask &= ~(1ULL << iter->tlabel);
-			t = iter;
-			break;
-		}
+	// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
+	// local destination never runs in any type of IRQ context.
+	scoped_guard(spinlock_irqsave, &card->transactions.lock) {
+		t = find_and_pop_transaction_entry(card,
+				iter->node_id == source && iter->tlabel == tlabel);
 	}
-	spin_unlock_irqrestore(&card->lock, flags);
 
-	trace_async_response_inbound((uintptr_t)t, p->generation, p->speed, p->ack, p->timestamp,
-				     p->header, data, data_length / 4);
+	trace_async_response_inbound((uintptr_t)t, card->index, p->generation, p->speed, p->ack,
+				     p->timestamp, p->header, data, data_length / 4);
 
 	if (!t) {
- timed_out:
 		fw_notice(card, "unsolicited response (source %x, tlabel %x)\n",
 			  source, tlabel);
 		return;
@@ -1151,7 +1254,11 @@ static void handle_topology_map(struct fw_card *card, struct fw_request *request
 	}
 
 	start = (offset - topology_map_region.start) / 4;
-	memcpy(payload, &card->topology_map[start], length);
+
+	// NOTE: This can be without irqsave when we can guarantee that fw_send_request() for local
+	// destination never runs in any type of IRQ context.
+	scoped_guard(spinlock_irqsave, &card->topology_map.lock)
+		memcpy(payload, &card->topology_map.buffer[start], length);
 
 	fw_send_response(card, request, RCODE_COMPLETE);
 }
@@ -1166,16 +1273,17 @@ static const struct fw_address_region registers_region =
 	  .end   = CSR_REGISTER_BASE | CSR_CONFIG_ROM, };
 
 static void update_split_timeout(struct fw_card *card)
+__must_hold(&card->split_timeout.lock)
 {
 	unsigned int cycles;
 
-	cycles = card->split_timeout_hi * 8000 + (card->split_timeout_lo >> 19);
+	cycles = card->split_timeout.hi * 8000 + (card->split_timeout.lo >> 19);
 
 	/* minimum per IEEE 1394, maximum which doesn't overflow OHCI */
 	cycles = clamp(cycles, 800u, 3u * 8000u);
 
-	card->split_timeout_cycles = cycles;
-	card->split_timeout_jiffies = DIV_ROUND_UP(cycles * HZ, 8000);
+	card->split_timeout.cycles = cycles;
+	card->split_timeout.jiffies = isoc_cycles_to_jiffies(cycles);
 }
 
 static void handle_registers(struct fw_card *card, struct fw_request *request,
@@ -1186,7 +1294,6 @@ static void handle_registers(struct fw_card *card, struct fw_request *request,
 	int reg = offset & ~CSR_REGISTER_BASE;
 	__be32 *data = payload;
 	int rcode = RCODE_COMPLETE;
-	unsigned long flags;
 
 	switch (reg) {
 	case CSR_PRIORITY_BUDGET:
@@ -1226,12 +1333,15 @@ static void handle_registers(struct fw_card *card, struct fw_request *request,
 
 	case CSR_SPLIT_TIMEOUT_HI:
 		if (tcode == TCODE_READ_QUADLET_REQUEST) {
-			*data = cpu_to_be32(card->split_timeout_hi);
+			*data = cpu_to_be32(card->split_timeout.hi);
 		} else if (tcode == TCODE_WRITE_QUADLET_REQUEST) {
-			spin_lock_irqsave(&card->lock, flags);
-			card->split_timeout_hi = be32_to_cpu(*data) & 7;
-			update_split_timeout(card);
-			spin_unlock_irqrestore(&card->lock, flags);
+			// NOTE: This can be without irqsave when we can guarantee that
+			// __fw_send_request() for local destination never runs in any type of IRQ
+			// context.
+			scoped_guard(spinlock_irqsave, &card->split_timeout.lock) {
+				card->split_timeout.hi = be32_to_cpu(*data) & 7;
+				update_split_timeout(card);
+			}
 		} else {
 			rcode = RCODE_TYPE_ERROR;
 		}
@@ -1239,13 +1349,15 @@ static void handle_registers(struct fw_card *card, struct fw_request *request,
 
 	case CSR_SPLIT_TIMEOUT_LO:
 		if (tcode == TCODE_READ_QUADLET_REQUEST) {
-			*data = cpu_to_be32(card->split_timeout_lo);
+			*data = cpu_to_be32(card->split_timeout.lo);
 		} else if (tcode == TCODE_WRITE_QUADLET_REQUEST) {
-			spin_lock_irqsave(&card->lock, flags);
-			card->split_timeout_lo =
-					be32_to_cpu(*data) & 0xfff80000;
-			update_split_timeout(card);
-			spin_unlock_irqrestore(&card->lock, flags);
+			// NOTE: This can be without irqsave when we can guarantee that
+			// __fw_send_request() for local destination never runs in any type of IRQ
+			// context.
+			scoped_guard(spinlock_irqsave, &card->split_timeout.lock) {
+				card->split_timeout.lo = be32_to_cpu(*data) & 0xfff80000;
+				update_split_timeout(card);
+			}
 		} else {
 			rcode = RCODE_TYPE_ERROR;
 		}
@@ -1356,7 +1468,8 @@ static int __init fw_core_init(void)
 {
 	int ret;
 
-	fw_workqueue = alloc_workqueue("firewire", WQ_MEM_RECLAIM, 0);
+	fw_workqueue = alloc_workqueue("firewire", WQ_MEM_RECLAIM | WQ_UNBOUND,
+				       0);
 	if (!fw_workqueue)
 		return -ENOMEM;
 
@@ -1387,7 +1500,7 @@ static void __exit fw_core_cleanup(void)
 	unregister_chrdev(fw_cdev_major, "firewire");
 	bus_unregister(&fw_bus_type);
 	destroy_workqueue(fw_workqueue);
-	idr_destroy(&fw_device_idr);
+	xa_destroy(&fw_device_xa);
 }
 
 module_init(fw_core_init);
